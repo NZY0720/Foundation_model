@@ -1,7 +1,7 @@
 # 配置文件：config.py
 
 # 数据路径配置
-DATA_DIR = "data"  # 修改为实际 block 文件所在路径
+DATA_DIR = "data/data_block"  # 修改为实际 block 文件所在路径
 HOUSEHOLD_INFO_PATH = "data/informations_households.csv"  # household 信息路径
 WEATHER_DATA_PATH = "data/weather_hourly_darksky.csv"  # 天气数据路径
 

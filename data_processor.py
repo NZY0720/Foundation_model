@@ -3,7 +3,8 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
 
 class BlockDataProcessor:
     def __init__(self, data_dir, household_info_path, weather_data_path, seq_length=48):
@@ -19,7 +20,7 @@ class BlockDataProcessor:
         """
         all_files = [os.path.join(self.data_dir, f) for f in os.listdir(self.data_dir) if f.startswith("block_")]
         data_frames = []
-        for file in all_files:
+        for file in tqdm(all_files, desc="Loading block files", unit="file"):
             df = pd.read_csv(file)
             data_frames.append(df)
         data = pd.concat(data_frames, ignore_index=True)
@@ -52,42 +53,63 @@ class BlockDataProcessor:
         # 合并 block 数据和 household 辅助信息
         merged_data = pd.merge(block_data, household_info, on="LCLid", how="left")
         
+        # 格式化日期
+        merged_data["timestamp"] = pd.to_datetime(merged_data["day"])  # 使用已存在的 'day' 列生成 timestamp
+
+        # 合并天气数据（通过时间对齐）
+        weather_data["timestamp"] = weather_data["time"]  # 为天气数据生成一个 'timestamp' 列
+        merged_data = pd.merge_asof(merged_data.sort_values("timestamp"), weather_data.sort_values("timestamp"),
+                                     on="timestamp", direction="nearest")  # 按时间戳合并天气数据
+
         # 展开时间序列并加入天气数据
         time_series = []
-        for _, row in merged_data.iterrows():
-            for i in range(48):
-                timestamp_str = f"{row['day']} {i//2:02d}:{(i%2)*30:02d}"
-                
-                # 转换为时间戳
-                try:
-                    timestamp = pd.to_datetime(timestamp_str)  # 转换为时间戳
-                except ValueError as e:
-                    print(f"Error parsing timestamp: {timestamp_str} -> {e}")
-                    continue  # 跳过无法解析的时间戳
+        for i in range(48):  # 每天有48个时间点
+            time_series.append(merged_data[["LCLid", "timestamp", f"hh_{i}", "stdorToU", "Acorn", "Acorn_grouped"] + list(weather_data.columns[1:])].copy())
+            time_series[-1]["timestamp"] = time_series[-1]["timestamp"] + pd.to_timedelta(i * 30, unit="min")  # 设置每个时间段
 
-                # 合并天气数据
-                weather_row = weather_data[weather_data["time"] == timestamp]
-                if not weather_row.empty:
-                    weather_features = weather_row.iloc[0].to_dict()  # 获取天气特征
-                else:
-                    weather_features = {col: np.nan for col in weather_data.columns}  # 缺失填充
-                
-                time_series.append({
-                    "LCLid": row["LCLid"],
-                    "timestamp": timestamp,
-                    "value": row[f"hh_{i}"],
-                    "stdorToU": row["stdorToU"],
-                    "Acorn": row["Acorn"],
-                    "Acorn_grouped": row["Acorn_grouped"],
-                    **weather_features
-                })
-        
-        time_series_df = pd.DataFrame(time_series)
-        
+        # 合并所有时间段数据
+        time_series_df = pd.concat(time_series, ignore_index=True)
+
         # 填补缺失值
         time_series_df.fillna(method="ffill", inplace=True)
         time_series_df.fillna(method="bfill", inplace=True)
         return time_series_df
+
+    def process_row(self, row, weather_data):
+        """
+        处理单个行数据，生成对应的时间序列。
+        :param row: pandas.Series 当前行数据
+        :param weather_data: pandas.DataFrame 天气数据
+        :return: list 生成的时间序列
+        """
+        time_series = []
+        for i in range(48):
+            timestamp_str = f"{row['day']} {i//2:02d}:{(i%2)*30:02d}"
+
+            # 转换为时间戳
+            try:
+                timestamp = pd.to_datetime(timestamp_str)  # 转换为时间戳
+            except ValueError as e:
+                print(f"Error parsing timestamp: {timestamp_str} -> {e}")
+                continue  # 跳过无法解析的时间戳
+
+            # 合并天气数据
+            weather_row = weather_data[weather_data["time"] == timestamp]
+            if not weather_row.empty:
+                weather_features = weather_row.iloc[0].to_dict()  # 获取天气特征
+            else:
+                weather_features = {col: np.nan for col in weather_data.columns}  # 缺失填充
+            
+            time_series.append({
+                "LCLid": row["LCLid"],
+                "timestamp": timestamp,
+                "value": row[f"hh_{i}"],
+                "stdorToU": row["stdorToU"],
+                "Acorn": row["Acorn"],
+                "Acorn_grouped": row["Acorn_grouped"],
+                **weather_features
+            })
+        return time_series
 
     def create_sequences(self, data):
         """
