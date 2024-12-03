@@ -1,80 +1,140 @@
+import os
 import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 
-class DataProcessor:
-    def __init__(self, file_path, seq_length=7):
-        """
-        数据处理器，用于加载和预处理数据，构造时间序列输入。
-        :param file_path: 数据文件路径 (CSV)
-        :param seq_length: 时间序列窗口长度
-        """
-        self.file_path = file_path
+class BlockDataProcessor:
+    def __init__(self, data_dir, household_info_path, weather_data_path, seq_length=48):
+        self.data_dir = data_dir
+        self.household_info_path = household_info_path
+        self.weather_data_path = weather_data_path
         self.seq_length = seq_length
 
-    def load_data(self):
+    def load_all_blocks(self):
         """
-        加载 CSV 数据文件并解析日期列。
+        读取所有 block 文件并合并。
         :return: pandas.DataFrame
         """
-        data = pd.read_csv(self.file_path, parse_dates=["day"])
+        all_files = [os.path.join(self.data_dir, f) for f in os.listdir(self.data_dir) if f.startswith("block_")]
+        data_frames = []
+        for file in all_files:
+            df = pd.read_csv(file)
+            data_frames.append(df)
+        data = pd.concat(data_frames, ignore_index=True)
         return data
+
+    def load_household_info(self):
+        """
+        加载 household 辅助信息。
+        :return: pandas.DataFrame
+        """
+        return pd.read_csv(self.household_info_path)
+
+    def load_weather_data(self):
+        """
+        加载天气数据并进行时间格式转换。
+        :return: pandas.DataFrame
+        """
+        weather_data = pd.read_csv(self.weather_data_path)
+        weather_data["time"] = pd.to_datetime(weather_data["time"])
+        return weather_data
+
+    def preprocess_data(self, block_data, household_info, weather_data):
+        """
+        将 block 数据与 household 和天气数据合并，生成时间序列数据。
+        :param block_data: pandas.DataFrame 原始 block 数据
+        :param household_info: pandas.DataFrame household 数据
+        :param weather_data: pandas.DataFrame 天气数据
+        :return: pandas.DataFrame 合并后的时间序列数据
+        """
+        # 合并 block 数据和 household 辅助信息
+        merged_data = pd.merge(block_data, household_info, on="LCLid", how="left")
+        
+        # 展开时间序列并加入天气数据
+        time_series = []
+        for _, row in merged_data.iterrows():
+            for i in range(48):
+                timestamp_str = f"{row['day']} {i//2:02d}:{(i%2)*30:02d}"
+                
+                # 转换为时间戳
+                try:
+                    timestamp = pd.to_datetime(timestamp_str)  # 转换为时间戳
+                except ValueError as e:
+                    print(f"Error parsing timestamp: {timestamp_str} -> {e}")
+                    continue  # 跳过无法解析的时间戳
+
+                # 合并天气数据
+                weather_row = weather_data[weather_data["time"] == timestamp]
+                if not weather_row.empty:
+                    weather_features = weather_row.iloc[0].to_dict()  # 获取天气特征
+                else:
+                    weather_features = {col: np.nan for col in weather_data.columns}  # 缺失填充
+                
+                time_series.append({
+                    "LCLid": row["LCLid"],
+                    "timestamp": timestamp,
+                    "value": row[f"hh_{i}"],
+                    "stdorToU": row["stdorToU"],
+                    "Acorn": row["Acorn"],
+                    "Acorn_grouped": row["Acorn_grouped"],
+                    **weather_features
+                })
+        
+        time_series_df = pd.DataFrame(time_series)
+        
+        # 填补缺失值
+        time_series_df.fillna(method="ffill", inplace=True)
+        time_series_df.fillna(method="bfill", inplace=True)
+        return time_series_df
 
     def create_sequences(self, data):
         """
-        将数据转换为时间序列格式，按用户分组构造滑动窗口。
-        :param data: pandas.DataFrame 原始数据
-        :return: (torch.Tensor, torch.Tensor) 输入序列和对应目标值
+        根据时间序列数据生成训练样本。
+        :param data: pandas.DataFrame 时间序列数据
+        :return: torch.Tensor 特征和目标
         """
         sequences = []
         labels = []
-
-        # 按 LCLid 分组
-        grouped = data.groupby("LCLid")
+        grouped = data.groupby("LCLid")  # 按用户分组
         for _, group in grouped:
-            group = group.sort_values("day")  # 按日期排序
-            # 提取特征列
-            features = group[[
-                "energy_median", "energy_mean", "energy_max", "energy_count", "energy_std", "energy_min"
-            ]].values
-            # 提取目标列
-            targets = group["energy_sum"].values
+            group = group.sort_values("timestamp")  # 按时间排序
+            values = group["value"].values
+            # 对类别特征进行 One-Hot 编码
+            stdorToU = pd.get_dummies(group["stdorToU"], drop_first=True).values
+            acorn_grouped = pd.get_dummies(group["Acorn_grouped"], drop_first=True).values
+            precip_type = pd.get_dummies(group["precipType"], drop_first=True).values
+            icon = pd.get_dummies(group["icon"], drop_first=True).values
+            
+            # 选取数值型天气特征
+            weather_features = group[["temperature", "humidity", "pressure", "windSpeed"]].values
 
-            # 滑动窗口构造序列
-            for i in range(len(group) - self.seq_length):
-                sequences.append(features[i:i + self.seq_length])
-                labels.append(targets[i + self.seq_length])
-
-        # 转换为 numpy 数组再转换为 Tensor
+            auxiliary_features = np.hstack([
+                stdorToU, acorn_grouped, precip_type, icon, weather_features
+            ])  # 辅助特征
+            for i in range(len(values) - self.seq_length):
+                main_sequence = values[i:i + self.seq_length]
+                aux_features = auxiliary_features[i:i + self.seq_length]
+                sequences.append(np.hstack([main_sequence.reshape(-1, 1), aux_features]))  # 合并主序列和辅助特征
+                labels.append(values[i + self.seq_length])  # 第 seq_length + 1 时间步的目标值
         sequences = np.array(sequences, dtype=np.float32)
         labels = np.array(labels, dtype=np.float32)
-
         return torch.tensor(sequences), torch.tensor(labels)
 
 
 class EnergyDataset(Dataset):
     def __init__(self, sequences, labels):
         """
-        自定义数据集，用于包装时间序列数据和目标值。
-        :param sequences: 输入序列 (torch.Tensor)
+        自定义数据集，用于包装时间序列数据。
+        :param sequences: 输入特征 (torch.Tensor)
         :param labels: 目标值 (torch.Tensor)
         """
         self.sequences = sequences
         self.labels = labels
 
     def __len__(self):
-        """
-        数据集大小
-        :return: int
-        """
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        """
-        获取单个样本
-        :param idx: 索引
-        :return: (torch.Tensor, torch.Tensor) 输入序列和目标值
-        """
         return self.sequences[idx], self.labels[idx]

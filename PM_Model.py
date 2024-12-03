@@ -1,5 +1,6 @@
 from encoder import TemporalEncoder, HierarchicalEncoder
 from torch import nn
+from torch.nn import functional as F
 
 class PowerPM(nn.Module):
     def __init__(self, input_dim, model_dim, num_heads, num_layers, hidden_dim, num_relations):
@@ -10,7 +11,7 @@ class PowerPM(nn.Module):
 
     def forward(self, x, exogenous_vars=None, edge_index=None, edge_type=None):
         # 时间编码器
-        temporal_out = self.temporal_encoder(x, exogenous_vars)  # 输出形状 [batch_size, seq_length, model_dim]
+        temporal_out = self.temporal_encoder(x, exogenous_vars)
 
         # 层次编码器（如果没有图结构则跳过）
         if edge_index is not None and edge_type is not None:
@@ -18,9 +19,12 @@ class PowerPM(nn.Module):
         else:
             hierarchical_out = temporal_out
 
-        # 对最后一个时间步的输出应用线性变换
-        final_out = self.final_linear(hierarchical_out[:, -1, :])  # 取最后一个时间步
-        return final_out.squeeze(-1)  # 输出形状 [batch_size]
+        # 全局特征池化
+        global_feature = F.adaptive_avg_pool1d(hierarchical_out.permute(0, 2, 1), 1).squeeze(-1)
+
+        # 通过线性层生成最终输出
+        final_out = self.final_linear(global_feature)
+        return final_out.squeeze(-1)
 
     def count_parameters(self):
         """
